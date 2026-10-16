@@ -1,0 +1,151 @@
+name: Continuous Delivery & Release
+
+# Promotes the release candidate that main.yml published for this commit to the stable version: the exact tested
+# image is re-tagged as X.Y.Z and `latest` (same digest, no rebuild), then git-tagged and released with grouped
+# release notes. Afterwards, that version's other release candidates are pruned from GHCR.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Check the release candidate and show the release notes and what would be pruned, without changing anything
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository_owner }}/thread-udp-proxy
+
+jobs:
+  version:
+    uses: ./.github/workflows/version.yml
+    permissions:
+      contents: read
+
+  promote:
+    name: Promote, Tag & Release
+    needs: version
+    if: needs.version.outputs.version_type != 'none'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      VERSION_TAG: ${{ needs.version.outputs.version_tag }}
+      COMMIT_TAG: ${{ needs.version.outputs.commit_tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - name: Only main publishes
+        if: ${{ !inputs.dry_run && github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::Releases are published from main only; dispatch with dry_run to check another branch."
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Release notes
+        uses: hononeko/actions/release-notes@e47317ebddcf234262ded57b9a986397c8c52942 # v1.1.1
+        with:
+          previous-tag: ${{ needs.version.outputs.last_tag }}
+          tag: ${{ needs.version.outputs.version_tag }}
+          summary: Release notes for ${{ needs.version.outputs.version_tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find the release candidate
+        id: rc
+        run: |
+          if ! docker buildx imagetools inspect "$IMAGE:$COMMIT_TAG" > /dev/null 2>&1; then
+            echo "::error::No release candidate for this commit: $IMAGE:$COMMIT_TAG doesn't exist. Main Validation publishes it; check that its run passed for ${GITHUB_SHA::7}."
+            exit 1
+          fi
+          docker buildx imagetools inspect "$IMAGE:$COMMIT_TAG"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$COMMIT_TAG" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release $VERSION"
+            echo "Release candidate \`$IMAGE:$COMMIT_TAG\`, digest \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Promote to stable
+        env:
+          DIGEST: ${{ steps.rc.outputs.digest }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: would tag $IMAGE@$DIGEST as $VERSION and latest"
+            echo "Dry run: would tag \`$DIGEST\` as \`$VERSION\` and \`latest\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" "$IMAGE@$DIGEST"
+          # Re-tagging keeps the digest, so the release is byte-for-byte the tested candidate and keeps its attestation.
+          for tag in "$VERSION" latest; do
+            got=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+            if [ "$got" != "$DIGEST" ]; then
+              echo "::error::$IMAGE:$tag is $got, expected the release candidate's $DIGEST"
+              exit 1
+            fi
+          done
+          echo "Tagged as \`$VERSION\` and \`latest\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag & create the GitHub Release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$VERSION_TAG" --target "$GITHUB_SHA" --title "$VERSION_TAG" --notes-file release-notes.md
+
+  # Removes this version's release candidates now that one of them is the release. Tags are unlinked rather than
+  # images deleted when an image keeps other tags, so the promoted image survives as X.Y.Z / latest, and so does a
+  # newer candidate still tagged `edge`. A separate job: a pruning failure never undoes the release.
+  prune:
+    name: Prune Release Candidates
+    needs: [version, promote]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      # The candidates of this version: its X.Y.Z-rc.N tags, and the commit tags of every commit since the last release.
+      # The pattern can't match X.Y.Z, latest or edge, so there's no exclude-tags: it protects whole images, and would
+      # keep the promoted image's own rc/sha tags too.
+      - name: Select release candidate tags
+        id: select
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          LAST_TAG: ${{ needs.version.outputs.last_tag }}
+        run: |
+          range=HEAD
+          if [ -n "$LAST_TAG" ]; then range="$LAST_TAG..HEAD"; fi
+          commits=$(git rev-list "$range" | cut -c1-7 | paste -sd'|' -)
+          pattern="^(${VERSION//./\\.}-rc\.[0-9]+|sha-($commits))$"
+          echo "pattern=$pattern" >> "$GITHUB_OUTPUT"
+          echo "Pruning tags matching: $pattern"
+
+      - name: Prune
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          package: thread-udp-proxy
+          use-regex: true
+          delete-tags: ${{ steps.select.outputs.pattern }}
+          validate: true
+          dry-run: ${{ inputs.dry_run }}
