@@ -51,7 +51,7 @@ The binary also accepts `-healthcheck` (probes `/healthz`, for runtimes without 
 
 ## Kubernetes
 
-The proxy needs **`CAP_NET_RAW`**. The image grants it to the binary as a file capability, so it runs as the `nonroot` user, but the container must keep `NET_RAW` in its capability set. **Without it the binary can't even be executed** (`exec ...: operation not permitted`).
+The proxy needs **`CAP_NET_RAW`**. The image grants it to the binary as a file capability, so it runs as the `nonroot` user (UID 65532), but the container must keep `NET_RAW` in its capability set. **Without it the binary can't even be executed** (`exec ...: operation not permitted`).
 
 ```yaml
 - name: thread-udp-proxy
