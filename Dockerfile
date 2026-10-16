@@ -22,8 +22,8 @@ WORKDIR /
 # Copy compiled binary (with its file capability) from builder
 COPY --from=builder /out/thread-udp-proxy /app/thread-udp-proxy
 
-# Adhere to rootless mandates
-USER nonroot:nonroot
+# Adhere to rootless mandates. Numeric (distroless "nonroot") so Kubernetes can verify runAsNonRoot.
+USER 65532:65532
 
 EXPOSE 9090
 

@@ -63,7 +63,7 @@ Before committing or submitting changes, all of the following steps **MUST** pas
 ### 3.1 Minimal & Rootless Containers
 * **Static binary:** `CGO_ENABLED=0 go build -trimpath -ldflags="-w -s"`.
 * **Distroless base:** `gcr.io/distroless/static-debian12:nonroot`.
-* **Non-root execution:** `USER nonroot:nonroot`. `CAP_NET_RAW` is granted as a file capability (`setcap cap_net_raw=+ep`), never by running as root.
+* **Non-root execution:** `USER 65532:65532`, distroless's `nonroot`. The UID must be numeric, or Kubernetes can't verify `runAsNonRoot`. `CAP_NET_RAW` is granted as a file capability (`setcap cap_net_raw=+ep`), never by running as root.
 
 ### 3.2 HTTP Server Hardening
 * Every `http.Server` sets `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout` and `MaxHeaderBytes`.
