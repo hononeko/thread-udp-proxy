@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -190,6 +192,7 @@ func setupMux(cfg config.Config, p *proxy.Proxy, st *state) *http.ServeMux {
 			"forwarded":      stats.Forwarded,
 			"replies":        stats.Replies,
 			"dropped":        stats.Dropped,
+			"ignored":        stats.Ignored,
 			"active_clients": stats.ActiveMappings,
 		})
 	})
@@ -215,13 +218,30 @@ thread_udp_proxy_reply_datagrams_total %d
 # HELP thread_udp_proxy_dropped_datagrams_total Datagrams that matched but could not be relayed.
 # TYPE thread_udp_proxy_dropped_datagrams_total counter
 thread_udp_proxy_dropped_datagrams_total %d
+# HELP thread_udp_proxy_ignored_frames_total Frames read from the interface that weren't ours to relay.
+# TYPE thread_udp_proxy_ignored_frames_total counter
+thread_udp_proxy_ignored_frames_total %d
 # HELP thread_udp_proxy_active_clients Clients with an open relay socket.
 # TYPE thread_udp_proxy_active_clients gauge
 thread_udp_proxy_active_clients %d
-`, up, stats.Forwarded, stats.Replies, stats.Dropped, stats.ActiveMappings)
+`, up, stats.Forwarded, stats.Replies, stats.Dropped, stats.Ignored, stats.ActiveMappings)
+		writeHistogram(w, "thread_udp_proxy_forward_latency_seconds",
+			"Time from a client frame reaching the interface to its datagram being sent into the mesh.", stats.ForwardLatency)
+		writeHistogram(w, "thread_udp_proxy_reply_latency_seconds",
+			"Time from a reply reaching its socket to its frame being written back to the client.", stats.ReplyLatency)
 	})
 
 	return mux
+}
+
+// writeHistogram writes h in the Prometheus text exposition format.
+func writeHistogram(w io.Writer, name, help string, h proxy.Histogram) {
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
+	for i, bound := range proxy.LatencyBuckets {
+		_, _ = fmt.Fprintf(w, "%s_bucket{le=%q} %d\n", name, strconv.FormatFloat(bound.Seconds(), 'g', -1, 64), h.Cumulative[i])
+	}
+	_, _ = fmt.Fprintf(w, "%s_bucket{le=\"+Inf\"} %d\n%s_sum %s\n%s_count %d\n",
+		name, h.Count, name, strconv.FormatFloat(h.Sum.Seconds(), 'g', -1, 64), name, h.Count)
 }
 
 func runCLIHealthCheck(listenAddr, listenPort string) int {

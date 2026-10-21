@@ -7,14 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type rawConn struct {
 	fd      int
 	ifindex int
 	hw      net.HardwareAddr
+	// oob receives each frame's kernel timestamp. Only the single reader uses it.
+	oob []byte
 }
 
 // Listen opens an AF_PACKET socket that reads the IPv6 frames addressed to iface's MAC and writes frames out of
@@ -28,42 +31,50 @@ func Listen(iface string, readTimeout time.Duration) (FrameConn, error) {
 		return nil, fmt.Errorf("interface %q has no Ethernet address", iface)
 	}
 
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, int(htons(syscall.ETH_P_IPV6)))
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, int(htons(unix.ETH_P_IPV6)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open a raw packet socket (needs CAP_NET_RAW): %w", err)
 	}
-	if err := syscall.Bind(fd, &syscall.SockaddrLinklayer{Protocol: htons(syscall.ETH_P_IPV6), Ifindex: ifi.Index}); err != nil {
-		_ = syscall.Close(fd)
+	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: htons(unix.ETH_P_IPV6), Ifindex: ifi.Index}); err != nil {
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("failed to bind the raw packet socket to %q: %w", iface, err)
 	}
-	tv := syscall.NsecToTimeval(readTimeout.Nanoseconds())
-	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
-		_ = syscall.Close(fd)
+	tv := unix.NsecToTimeval(readTimeout.Nanoseconds())
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("failed to set the read timeout: %w", err)
 	}
-	return &rawConn{fd: fd, ifindex: ifi.Index, hw: ifi.HardwareAddr}, nil
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPNS, 1); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("failed to enable receive timestamps: %w", err)
+	}
+	return &rawConn{fd: fd, ifindex: ifi.Index, hw: ifi.HardwareAddr, oob: make([]byte, oobSize)}, nil
 }
 
-func (c *rawConn) ReadFrame(buf []byte) (int, error) {
+func (c *rawConn) ReadFrame(buf []byte) (int, time.Time, error) {
 	for {
-		n, from, err := syscall.Recvfrom(c.fd, buf, 0)
-		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
-			return 0, ErrTimeout
+		n, oobn, _, from, err := unix.Recvmsg(c.fd, buf, c.oob, 0)
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
+			return 0, time.Time{}, ErrTimeout
 		}
 		if err != nil {
-			return 0, err
+			return 0, time.Time{}, err
 		}
 		// Only frames sent to this host. A packet socket also sees the host's own outgoing frames, including the
 		// replies this proxy writes, which would otherwise be relayed again if a client used the relayed port.
-		if ll, ok := from.(*syscall.SockaddrLinklayer); ok && ll.Pkttype != syscall.PACKET_HOST {
+		if ll, ok := from.(*unix.SockaddrLinklayer); ok && ll.Pkttype != unix.PACKET_HOST {
 			continue
 		}
-		return n, nil
+		rx, ok := kernelTimestamp(c.oob[:oobn])
+		if !ok {
+			rx = time.Now()
+		}
+		return n, rx, nil
 	}
 }
 
 func (c *rawConn) WriteFrame(frame []byte) error {
-	return syscall.Sendto(c.fd, frame, 0, &syscall.SockaddrLinklayer{Protocol: htons(syscall.ETH_P_IPV6), Ifindex: c.ifindex})
+	return unix.Sendto(c.fd, frame, 0, &unix.SockaddrLinklayer{Protocol: htons(unix.ETH_P_IPV6), Ifindex: c.ifindex})
 }
 
 func (c *rawConn) HardwareAddr() net.HardwareAddr {
@@ -71,7 +82,7 @@ func (c *rawConn) HardwareAddr() net.HardwareAddr {
 }
 
 func (c *rawConn) Close() error {
-	return syscall.Close(c.fd)
+	return unix.Close(c.fd)
 }
 
 // htons converts v to network byte order, as packet sockets expect protocol numbers.
