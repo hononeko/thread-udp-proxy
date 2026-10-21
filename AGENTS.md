@@ -45,6 +45,7 @@ Before committing or submitting changes, all of the following steps **MUST** pas
 * **The data path stays allocation-light and single-owner:** `proxy.Run` alone owns the client mappings map. Other goroutines talk to it over channels, and counters are atomics.
 * **Validate before trusting:** `packet.Parse` checks every length field before slicing. Malformed or unrelated frames are ignored silently, because the interface carries plenty of traffic that isn't ours.
 * **Never relay our own frames:** the raw socket only accepts `PACKET_HOST` frames, i.e. frames addressed to this host. Keep it that way, or replies can loop.
+* **Filter in the kernel, check in the proxy:** the raw socket carries a classic BPF filter (`relayFilter`) that only passes UDP over IPv6 to the relayed port, and ignores outgoing frames (`PACKET_IGNORE_OUTGOING`). This only saves work. `ReadFrame` and `handleFrame` keep every check, so the proxy stays correct without the filter. A filter change needs a case in `filter_test.go`, which runs the program in `x/net/bpf`'s VM.
 * **Checksums:** IPv6 UDP checksums are mandatory. `packet.Build` always writes one, never `0`.
 
 ### 2.3 Error Handling & Logging

@@ -82,7 +82,7 @@ func main() {
 	p := proxy.New(proxy.Config{Port: cfg.Port, Prefixes: cfg.Prefixes, IdleTimeout: cfg.IdleTimeout})
 	st := &state{}
 	// Attach before serving, so the readiness probe is accurate from its first answer.
-	conn, err := proxy.Listen(cfg.Interface, readTimeout)
+	conn, err := proxy.Listen(cfg.Interface, cfg.Port, readTimeout)
 	st.set(err == nil, err)
 
 	server := &http.Server{
@@ -106,7 +106,7 @@ func main() {
 	proxyDone := make(chan struct{})
 	go func() {
 		defer close(proxyDone)
-		supervise(ctx, cfg.Interface, p, st, conn, err)
+		supervise(ctx, cfg.Interface, cfg.Port, p, st, conn, err)
 	}()
 
 	select {
@@ -128,7 +128,7 @@ func main() {
 // supervise relays on conn (or retries opening iface after err), reopening the interface whenever it's missing or
 // fails, until ctx is cancelled. The interface may appear after the process starts, so failing to open it isn't fatal:
 // readiness reports it.
-func supervise(ctx context.Context, iface string, p *proxy.Proxy, st *state, conn proxy.FrameConn, err error) {
+func supervise(ctx context.Context, iface string, port uint16, p *proxy.Proxy, st *state, conn proxy.FrameConn, err error) {
 	for {
 		if err == nil {
 			st.set(true, nil)
@@ -147,7 +147,7 @@ func supervise(ctx context.Context, iface string, p *proxy.Proxy, st *state, con
 			return
 		case <-time.After(retryDelay):
 		}
-		conn, err = proxy.Listen(iface, readTimeout)
+		conn, err = proxy.Listen(iface, port, readTimeout)
 	}
 }
 

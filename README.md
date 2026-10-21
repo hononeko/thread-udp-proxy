@@ -12,6 +12,8 @@ When several border routers advertise the same Thread prefix, you don't choose w
 2. The proxy picks up those frames on the infrastructure interface and sends each payload into the mesh from a socket of its own, one per client. To the Thread node, the request comes from the OTBR.
 3. The node's reply comes back to that socket. The proxy writes it to the client as a raw frame that appears to come straight from the node.
 
+A BPF filter on the raw socket passes only UDP over IPv6 to the relayed port, so the rest of the interface's traffic (neighbor discovery, mDNS, the host's own frames) is dropped in the kernel and costs the proxy nothing.
+
 This is NAT, so the end-to-end payload is untouched. Protocols that don't bind sessions to IP addresses, like Matter, which secures messages by session ID, keep working.
 
 ```

@@ -9,7 +9,10 @@ import (
 	"net"
 	"time"
 
+	"golang.org/x/net/bpf"
 	"golang.org/x/sys/unix"
+
+	"github.com/hononeko/thread-udp-proxy/pkg/logger"
 )
 
 type rawConn struct {
@@ -20,9 +23,10 @@ type rawConn struct {
 	oob []byte
 }
 
-// Listen opens an AF_PACKET socket that reads the IPv6 frames addressed to iface's MAC and writes frames out of
-// iface. It needs CAP_NET_RAW. Reads return ErrTimeout after readTimeout without a frame.
-func Listen(iface string, readTimeout time.Duration) (FrameConn, error) {
+// Listen opens an AF_PACKET socket that reads the frames addressed to iface's MAC carrying UDP datagrams over IPv6 to
+// port, and writes frames out of iface. It needs CAP_NET_RAW. Reads return ErrTimeout after readTimeout without a
+// frame.
+func Listen(iface string, port uint16, readTimeout time.Duration) (FrameConn, error) {
 	ifi, err := net.InterfaceByName(iface)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find interface %q: %w", iface, err)
@@ -30,10 +34,24 @@ func Listen(iface string, readTimeout time.Duration) (FrameConn, error) {
 	if len(ifi.HardwareAddr) != 6 {
 		return nil, fmt.Errorf("interface %q has no Ethernet address", iface)
 	}
+	filter, err := assembleFilter(port)
+	if err != nil {
+		return nil, err
+	}
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, int(htons(unix.ETH_P_IPV6)))
+	// Protocol 0 receives nothing until the bind below, so no frame gets in before the filter is attached.
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open a raw packet socket (needs CAP_NET_RAW): %w", err)
+	}
+	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, filter); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("failed to attach the socket filter: %w", err)
+	}
+	// Don't even queue the host's own outgoing frames (Linux 4.20+). ReadFrame skips them anyway, so an older kernel
+	// only costs the copies.
+	if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_IGNORE_OUTGOING, 1); err != nil {
+		logger.Debug("Can't ignore outgoing frames in the kernel, skipping them in the proxy instead", "err", err)
 	}
 	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: htons(unix.ETH_P_IPV6), Ifindex: ifi.Index}); err != nil {
 		_ = unix.Close(fd)
@@ -83,6 +101,19 @@ func (c *rawConn) HardwareAddr() net.HardwareAddr {
 
 func (c *rawConn) Close() error {
 	return unix.Close(c.fd)
+}
+
+// assembleFilter compiles relayFilter for the kernel.
+func assembleFilter(port uint16) (*unix.SockFprog, error) {
+	raw, err := bpf.Assemble(relayFilter(port))
+	if err != nil {
+		return nil, fmt.Errorf("failed to assemble the socket filter: %w", err)
+	}
+	prog := make([]unix.SockFilter, len(raw))
+	for i, ins := range raw {
+		prog[i] = unix.SockFilter{Code: ins.Op, Jt: ins.Jt, Jf: ins.Jf, K: ins.K}
+	}
+	return &unix.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}, nil //nolint:gosec // a handful of instructions
 }
 
 // htons converts v to network byte order, as packet sockets expect protocol numbers.
