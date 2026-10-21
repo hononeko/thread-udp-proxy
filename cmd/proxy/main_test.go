@@ -83,7 +83,17 @@ func TestMetrics(t *testing.T) {
 		"thread_udp_proxy_forwarded_datagrams_total 0",
 		"thread_udp_proxy_reply_datagrams_total 0",
 		"thread_udp_proxy_dropped_datagrams_total 0",
+		"thread_udp_proxy_ignored_frames_total 0",
 		"thread_udp_proxy_active_clients 0",
+		"# TYPE thread_udp_proxy_forward_latency_seconds histogram",
+		`thread_udp_proxy_forward_latency_seconds_bucket{le="1e-05"} 0`,
+		`thread_udp_proxy_forward_latency_seconds_bucket{le="0.0025"} 0`,
+		`thread_udp_proxy_forward_latency_seconds_bucket{le="+Inf"} 0`,
+		"thread_udp_proxy_forward_latency_seconds_sum 0",
+		"thread_udp_proxy_forward_latency_seconds_count 0",
+		"# TYPE thread_udp_proxy_reply_latency_seconds histogram",
+		`thread_udp_proxy_reply_latency_seconds_bucket{le="0.1"} 0`,
+		"thread_udp_proxy_reply_latency_seconds_count 0",
 	} {
 		if !strings.Contains(body, want+"\n") {
 			t.Errorf("/metrics is missing %q", want)

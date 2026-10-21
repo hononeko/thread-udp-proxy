@@ -25,9 +25,10 @@ var ErrTimeout = errors.New("read timed out")
 
 // FrameConn reads and writes raw Ethernet frames on one interface.
 type FrameConn interface {
-	// ReadFrame reads one inbound frame addressed to this host into buf. It returns ErrTimeout when none arrived in
-	// time, so the caller can check for cancellation.
-	ReadFrame(buf []byte) (int, error)
+	// ReadFrame reads one inbound frame addressed to this host into buf, and returns when the kernel received it (or
+	// the read time if that's unknown). It returns ErrTimeout when none arrived in time, so the caller can check for
+	// cancellation.
+	ReadFrame(buf []byte) (int, time.Time, error)
 	// WriteFrame sends one complete Ethernet frame.
 	WriteFrame(frame []byte) error
 	// HardwareAddr is the interface's MAC address, used as the source of reply frames.
@@ -47,10 +48,16 @@ type Config struct {
 
 // Stats are cumulative counters over the proxy's lifetime.
 type Stats struct {
-	Forwarded      uint64
-	Replies        uint64
-	Dropped        uint64
+	Forwarded uint64
+	Replies   uint64
+	Dropped   uint64
+	// Ignored counts frames read from the interface that weren't ours to relay.
+	Ignored        uint64
 	ActiveMappings int64
+	// ForwardLatency is the time from a client frame reaching the interface to its datagram being sent into the mesh.
+	ForwardLatency Histogram
+	// ReplyLatency is the time from a reply reaching its socket to its frame being written back to the client.
+	ReplyLatency Histogram
 }
 
 // Proxy relays matching datagrams between clients and the Thread mesh. Run may be called again with a new FrameConn
@@ -62,7 +69,11 @@ type Proxy struct {
 	forwarded atomic.Uint64
 	replies   atomic.Uint64
 	dropped   atomic.Uint64
+	ignored   atomic.Uint64
 	mappings  atomic.Int64
+
+	forwardLatency histogram
+	replyLatency   histogram
 }
 
 // New returns a proxy for cfg.
@@ -70,7 +81,14 @@ func New(cfg Config) *Proxy {
 	return &Proxy{
 		cfg: cfg,
 		listen: func() (*net.UDPConn, error) {
-			return net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified})
+			conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified})
+			if err != nil {
+				return nil, err
+			}
+			if err := enableTimestamps(conn); err != nil {
+				logger.Debug("Kernel receive timestamps unavailable, measuring reply latency from the read", "err", err)
+			}
+			return conn, nil
 		},
 	}
 }
@@ -81,7 +99,10 @@ func (p *Proxy) Stats() Stats {
 		Forwarded:      p.forwarded.Load(),
 		Replies:        p.replies.Load(),
 		Dropped:        p.dropped.Load(),
+		Ignored:        p.ignored.Load(),
 		ActiveMappings: p.mappings.Load(),
+		ForwardLatency: p.forwardLatency.snapshot(),
+		ReplyLatency:   p.replyLatency.snapshot(),
 	}
 }
 
@@ -96,10 +117,16 @@ type mapping struct {
 	lastActive time.Time
 }
 
+type frame struct {
+	data []byte
+	rx   time.Time
+}
+
 type reply struct {
 	key     clientKey
 	from    netip.AddrPort
 	payload []byte
+	rx      time.Time
 }
 
 // Run relays traffic on conn until ctx is cancelled (returning nil) or reading from conn fails. It closes every
@@ -108,7 +135,7 @@ func (p *Proxy) Run(ctx context.Context, conn FrameConn) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	frames := make(chan []byte, 1024)
+	frames := make(chan frame, 1024)
 	replies := make(chan reply, 1024)
 	readErr := make(chan error, 1)
 	go p.readFrames(ctx, conn, frames, readErr)
@@ -131,8 +158,8 @@ func (p *Proxy) Run(ctx context.Context, conn FrameConn) error {
 			return nil
 		case err := <-readErr:
 			return fmt.Errorf("failed to read frames: %w", err)
-		case frame := <-frames:
-			p.handleFrame(ctx, frame, mappings, replies)
+		case f := <-frames:
+			p.handleFrame(ctx, f, mappings, replies)
 		case r := <-replies:
 			p.handleReply(conn, r, mappings)
 		case now := <-sweep.C:
@@ -141,10 +168,10 @@ func (p *Proxy) Run(ctx context.Context, conn FrameConn) error {
 	}
 }
 
-func (p *Proxy) readFrames(ctx context.Context, conn FrameConn, frames chan<- []byte, readErr chan<- error) {
+func (p *Proxy) readFrames(ctx context.Context, conn FrameConn, frames chan<- frame, readErr chan<- error) {
 	buf := make([]byte, 65536)
 	for ctx.Err() == nil {
-		n, err := conn.ReadFrame(buf)
+		n, rx, err := conn.ReadFrame(buf)
 		if errors.Is(err, ErrTimeout) {
 			continue
 		}
@@ -152,20 +179,22 @@ func (p *Proxy) readFrames(ctx context.Context, conn FrameConn, frames chan<- []
 			readErr <- err
 			return
 		}
-		frame := make([]byte, n)
-		copy(frame, buf[:n])
+		data := make([]byte, n)
+		copy(data, buf[:n])
 		select {
-		case frames <- frame:
+		case frames <- frame{data: data, rx: rx}:
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (p *Proxy) handleFrame(ctx context.Context, frame []byte, mappings map[clientKey]*mapping, replies chan<- reply) {
-	d, err := packet.Parse(frame)
+func (p *Proxy) handleFrame(ctx context.Context, f frame, mappings map[clientKey]*mapping, replies chan<- reply) {
+	d, err := packet.Parse(f.data)
 	if err != nil || d.DstPort != p.cfg.Port || !p.relays(d.DstIP) {
-		return // Other traffic for this host (neighbor discovery, the host's own sockets, ...): not ours to relay.
+		// Other traffic for this host (neighbor discovery, the host's own sockets, ...): not ours to relay.
+		p.ignored.Add(1)
+		return
 	}
 
 	key := clientKey{addr: d.SrcIP, port: d.SrcPort}
@@ -192,21 +221,27 @@ func (p *Proxy) handleFrame(ctx context.Context, frame []byte, mappings map[clie
 		logger.Debug("Failed to forward datagram", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "dst", dst, "err", err)
 		return
 	}
+	p.forwardLatency.observe(time.Since(f.rx))
 	p.forwarded.Add(1)
 	logger.Debug("Forwarded datagram", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "dst", dst, "bytes", len(d.Payload))
 }
 
 func readReplies(ctx context.Context, key clientKey, conn *net.UDPConn, replies chan<- reply) {
 	buf := make([]byte, 65536)
+	oob := make([]byte, oobSize)
 	for {
-		n, from, err := conn.ReadFromUDPAddrPort(buf)
+		n, oobn, _, from, err := conn.ReadMsgUDPAddrPort(buf, oob)
 		if err != nil {
 			return // The socket was closed: the mapping expired or the proxy stopped.
+		}
+		rx, ok := kernelTimestamp(oob[:oobn])
+		if !ok {
+			rx = time.Now()
 		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 		select {
-		case replies <- reply{key: key, from: from, payload: payload}:
+		case replies <- reply{key: key, from: from, payload: payload, rx: rx}:
 		case <-ctx.Done():
 			return
 		}
@@ -238,6 +273,7 @@ func (p *Proxy) handleReply(conn FrameConn, r reply, mappings map[clientKey]*map
 		logger.Debug("Failed to return reply", "from", r.from, "client", client, "err", err)
 		return
 	}
+	p.replyLatency.observe(time.Since(r.rx))
 	p.replies.Add(1)
 	logger.Debug("Returned reply", "from", r.from, "client", client, "bytes", len(r.payload))
 }

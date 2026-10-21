@@ -45,7 +45,9 @@ The proxy fails to start on an invalid setting instead of falling back to a defa
 | `/healthz` | Liveness: the process is serving |
 | `/readyz` | Readiness: attached to `PROXY_INTERFACE`. The proxy keeps retrying every 5s while the interface is missing |
 | `/status` | JSON: settings, attachment state, last error, counters |
-| `/metrics` | Prometheus: `thread_udp_proxy_up`, `_forwarded_datagrams_total`, `_reply_datagrams_total`, `_dropped_datagrams_total`, `_active_clients` |
+| `/metrics` | Prometheus: `thread_udp_proxy_up`, `_forwarded_datagrams_total`, `_reply_datagrams_total`, `_dropped_datagrams_total`, `_ignored_frames_total`, `_active_clients`, and the `_forward_latency_seconds` and `_reply_latency_seconds` histograms |
+
+The latency histograms measure the time each datagram spends in the proxy, from the kernel's receive timestamp to the send that relays it, from 10µs up to 100ms. `_ignored_frames_total` counts frames the proxy read from the interface but didn't relay, such as other traffic addressed to the host.
 
 The binary also accepts `-healthcheck` (probes `/healthz`, for runtimes without `curl`) and `-version`.
 

@@ -28,14 +28,14 @@ func newFakeConn() *fakeConn {
 	return &fakeConn{in: make(chan []byte, 16), out: make(chan []byte, 16), readErr: make(chan error, 1)}
 }
 
-func (c *fakeConn) ReadFrame(buf []byte) (int, error) {
+func (c *fakeConn) ReadFrame(buf []byte) (int, time.Time, error) {
 	select {
 	case frame := <-c.in:
-		return copy(buf, frame), nil
+		return copy(buf, frame), time.Now(), nil
 	case err := <-c.readErr:
-		return 0, err
+		return 0, time.Time{}, err
 	case <-time.After(10 * time.Millisecond):
-		return 0, ErrTimeout
+		return 0, time.Time{}, ErrTimeout
 	}
 }
 
@@ -150,9 +150,14 @@ func TestRelaysDatagramAndReply(t *testing.T) {
 		t.Errorf("reply MACs = %s -> %s, want %s -> %s", got.SrcMAC, got.DstMAC, proxyMAC, clientMAC)
 	}
 
+	// The reply is counted after its frame is written, so wait for that before checking the counters.
+	eventually(t, "the reply to be counted", func() bool { return p.Stats().Replies == 1 })
 	stats := p.Stats()
 	if stats.Forwarded != 1 || stats.Replies != 1 || stats.Dropped != 0 || stats.ActiveMappings != 1 {
 		t.Errorf("stats = %+v, want 1 forwarded, 1 reply, 0 dropped, 1 mapping", stats)
+	}
+	if stats.ForwardLatency.Count != 1 || stats.ReplyLatency.Count != 1 {
+		t.Errorf("latency counts = %d forward, %d reply, want 1 each", stats.ForwardLatency.Count, stats.ReplyLatency.Count)
 	}
 }
 
@@ -188,8 +193,8 @@ func TestIgnoresOtherTraffic(t *testing.T) {
 	if got := awaitFrame(t, conn); string(got.Payload) != "pong:relayed" {
 		t.Fatalf("first reply = %q, want the relayed datagram's", got.Payload)
 	}
-	if stats := p.Stats(); stats.Forwarded != 1 || stats.Dropped != 0 {
-		t.Fatalf("stats = %+v, want only the matching datagram forwarded and nothing dropped", stats)
+	if stats := p.Stats(); stats.Forwarded != 1 || stats.Dropped != 0 || stats.Ignored != 3 {
+		t.Fatalf("stats = %+v, want only the matching datagram forwarded, nothing dropped and 3 ignored", stats)
 	}
 }
 
