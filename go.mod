@@ -5,7 +5,7 @@ go 1.27.2
 require (
 	charm.land/log/v2 v2.0.1
 	github.com/charmbracelet/colorprofile v0.4.3
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
