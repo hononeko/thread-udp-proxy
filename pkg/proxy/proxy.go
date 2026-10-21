@@ -8,11 +8,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,7 +25,8 @@ import (
 // ErrTimeout is returned by FrameConn.ReadFrame when no frame arrived before the read deadline.
 var ErrTimeout = errors.New("read timed out")
 
-// FrameConn reads and writes raw Ethernet frames on one interface.
+// FrameConn reads and writes raw Ethernet frames on one interface. One goroutine reads, while WriteFrame and
+// HardwareAddr may be called from several goroutines at once, concurrently with ReadFrame.
 type FrameConn interface {
 	// ReadFrame reads one inbound frame addressed to this host into buf, and returns when the kernel received it (or
 	// the read time if that's unknown). It returns ErrTimeout when none arrived in time, so the caller can check for
@@ -111,86 +114,64 @@ type clientKey struct {
 	port uint16
 }
 
+// mapping is one client's NAT entry. The goroutine running Run owns the mappings map and conn's lifecycle, and the
+// client's reply goroutine reads from conn; clientMAC and lastActive are shared between the two, hence atomic.
 type mapping struct {
-	clientMAC  net.HardwareAddr
 	conn       *net.UDPConn
-	lastActive time.Time
+	clientMAC  atomic.Pointer[net.HardwareAddr]
+	lastActive atomic.Int64 // monotonic, see sinceStart
 }
 
-type frame struct {
-	data []byte
-	rx   time.Time
-}
+// start anchors sinceStart.
+var start = time.Now()
 
-type reply struct {
-	key     clientKey
-	from    netip.AddrPort
-	payload []byte
-	rx      time.Time
-}
+// sinceStart is t on the monotonic clock as an integer, so idle checks are immune to wall-clock steps (NTP).
+func sinceStart(t time.Time) int64 { return int64(t.Sub(start)) }
 
-// Run relays traffic on conn until ctx is cancelled (returning nil) or reading from conn fails. It closes every
-// client socket before returning; closing conn is left to the caller.
+func (m *mapping) touch(now time.Time) { m.lastActive.Store(sinceStart(now)) }
+
+func (m *mapping) setClientMAC(mac net.HardwareAddr) { m.clientMAC.Store(&mac) }
+
+// Run relays traffic on conn until ctx is cancelled (returning nil, within one read timeout) or reading from conn
+// fails. Each datagram is relayed by the goroutine that read it: frames by the one calling Run, replies by one
+// goroutine per client, so nothing waits on a hand-off. Run closes every client socket and waits for their reply
+// goroutines to finish before returning, so conn is no longer used once it returns; closing it is left to the caller.
 func (p *Proxy) Run(ctx context.Context, conn FrameConn) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	frames := make(chan frame, 1024)
-	replies := make(chan reply, 1024)
-	readErr := make(chan error, 1)
-	go p.readFrames(ctx, conn, frames, readErr)
-
 	// Owned by this goroutine alone.
 	mappings := make(map[clientKey]*mapping)
+	var replyWriters sync.WaitGroup
 	defer func() {
 		for _, m := range mappings {
 			_ = m.conn.Close()
 		}
 		p.mappings.Add(-int64(len(mappings)))
+		replyWriters.Wait()
 	}()
 
-	sweep := time.NewTicker(sweepInterval(p.cfg.IdleTimeout))
-	defer sweep.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case err := <-readErr:
-			return fmt.Errorf("failed to read frames: %w", err)
-		case f := <-frames:
-			p.handleFrame(ctx, f, mappings, replies)
-		case r := <-replies:
-			p.handleReply(conn, r, mappings)
-		case now := <-sweep.C:
-			p.expire(now, mappings)
-		}
-	}
-}
-
-func (p *Proxy) readFrames(ctx context.Context, conn FrameConn, frames chan<- frame, readErr chan<- error) {
+	interval := sweepInterval(p.cfg.IdleTimeout)
+	nextSweep := time.Now().Add(interval)
 	buf := make([]byte, 65536)
 	for ctx.Err() == nil {
 		n, rx, err := conn.ReadFrame(buf)
+		// Reads time out regularly, so idle clients are swept here too, without another goroutine touching mappings.
+		if now := time.Now(); !now.Before(nextSweep) {
+			p.expire(now, mappings)
+			nextSweep = now.Add(interval)
+		}
 		if errors.Is(err, ErrTimeout) {
 			continue
 		}
 		if err != nil {
-			readErr <- err
-			return
+			return fmt.Errorf("failed to read frames: %w", err)
 		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		select {
-		case frames <- frame{data: data, rx: rx}:
-		case <-ctx.Done():
-			return
-		}
+		p.handleFrame(buf[:n], rx, conn, mappings, &replyWriters)
 	}
+	return nil
 }
 
-func (p *Proxy) handleFrame(ctx context.Context, f frame, mappings map[clientKey]*mapping, replies chan<- reply) {
-	d, err := packet.Parse(f.data)
+// handleFrame relays one frame read from the interface. frame is only used until it returns.
+func (p *Proxy) handleFrame(frame []byte, rx time.Time, conn FrameConn, mappings map[clientKey]*mapping, replyWriters *sync.WaitGroup) {
+	d, err := packet.Parse(frame)
 	if err != nil || d.DstPort != p.cfg.Port || !p.relays(d.DstIP) {
 		// Other traffic for this host (neighbor discovery, the host's own sockets, ...): not ours to relay.
 		p.ignored.Add(1)
@@ -207,13 +188,15 @@ func (p *Proxy) handleFrame(ctx context.Context, f frame, mappings map[clientKey
 			return
 		}
 		m = &mapping{conn: udpConn}
+		m.setClientMAC(d.SrcMAC)
 		mappings[key] = m
 		p.mappings.Add(1)
-		go readReplies(ctx, key, udpConn, replies)
+		replyWriters.Go(func() { p.relayReplies(key, m, conn) })
 		logger.Info("New client", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "via", udpConn.LocalAddr())
+	} else if !bytes.Equal(*m.clientMAC.Load(), d.SrcMAC) {
+		m.setClientMAC(d.SrcMAC)
 	}
-	m.clientMAC = d.SrcMAC
-	m.lastActive = time.Now()
+	m.touch(time.Now())
 
 	dst := netip.AddrPortFrom(d.DstIP, d.DstPort)
 	if _, err := m.conn.WriteToUDPAddrPort(d.Payload, dst); err != nil {
@@ -221,16 +204,19 @@ func (p *Proxy) handleFrame(ctx context.Context, f frame, mappings map[clientKey
 		logger.Debug("Failed to forward datagram", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "dst", dst, "err", err)
 		return
 	}
-	p.forwardLatency.observe(time.Since(f.rx))
+	p.forwardLatency.observe(time.Since(rx))
 	p.forwarded.Add(1)
 	logger.Debug("Forwarded datagram", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "dst", dst, "bytes", len(d.Payload))
 }
 
-func readReplies(ctx context.Context, key clientKey, conn *net.UDPConn, replies chan<- reply) {
+// relayReplies writes each reply arriving on m's socket back to the client as a frame on conn, until the socket is
+// closed: when the client expires or Run stops, which is how cancellation reaches it.
+func (p *Proxy) relayReplies(key clientKey, m *mapping, conn FrameConn) {
 	buf := make([]byte, 65536)
 	oob := make([]byte, oobSize)
+	client := netip.AddrPortFrom(key.addr, key.port)
 	for {
-		n, oobn, _, from, err := conn.ReadMsgUDPAddrPort(buf, oob)
+		n, oobn, _, from, err := m.conn.ReadMsgUDPAddrPort(buf, oob)
 		if err != nil {
 			return // The socket was closed: the mapping expired or the proxy stopped.
 		}
@@ -238,49 +224,34 @@ func readReplies(ctx context.Context, key clientKey, conn *net.UDPConn, replies 
 		if !ok {
 			rx = time.Now()
 		}
-		payload := make([]byte, n)
-		copy(payload, buf[:n])
-		select {
-		case replies <- reply{key: key, from: from, payload: payload, rx: rx}:
-		case <-ctx.Done():
-			return
+		m.touch(time.Now())
+
+		frame, err := packet.Build(packet.Datagram{
+			DstMAC:  *m.clientMAC.Load(),
+			SrcMAC:  conn.HardwareAddr(),
+			SrcIP:   from.Addr(),
+			DstIP:   key.addr,
+			SrcPort: from.Port(),
+			DstPort: key.port,
+			Payload: buf[:n],
+		})
+		if err == nil {
+			err = conn.WriteFrame(frame)
 		}
+		if err != nil {
+			p.dropped.Add(1)
+			logger.Debug("Failed to return reply", "from", from, "client", client, "err", err)
+			continue
+		}
+		p.replyLatency.observe(time.Since(rx))
+		p.replies.Add(1)
+		logger.Debug("Returned reply", "from", from, "client", client, "bytes", n)
 	}
-}
-
-func (p *Proxy) handleReply(conn FrameConn, r reply, mappings map[clientKey]*mapping) {
-	m, ok := mappings[r.key]
-	if !ok {
-		return // Expired while the reply was queued.
-	}
-	m.lastActive = time.Now()
-
-	client := netip.AddrPortFrom(r.key.addr, r.key.port)
-	frame, err := packet.Build(packet.Datagram{
-		DstMAC:  m.clientMAC,
-		SrcMAC:  conn.HardwareAddr(),
-		SrcIP:   r.from.Addr(),
-		DstIP:   r.key.addr,
-		SrcPort: r.from.Port(),
-		DstPort: r.key.port,
-		Payload: r.payload,
-	})
-	if err == nil {
-		err = conn.WriteFrame(frame)
-	}
-	if err != nil {
-		p.dropped.Add(1)
-		logger.Debug("Failed to return reply", "from", r.from, "client", client, "err", err)
-		return
-	}
-	p.replyLatency.observe(time.Since(r.rx))
-	p.replies.Add(1)
-	logger.Debug("Returned reply", "from", r.from, "client", client, "bytes", len(r.payload))
 }
 
 func (p *Proxy) expire(now time.Time, mappings map[clientKey]*mapping) {
 	for key, m := range mappings {
-		if now.Sub(m.lastActive) > p.cfg.IdleTimeout {
+		if time.Duration(sinceStart(now)-m.lastActive.Load()) > p.cfg.IdleTimeout {
 			_ = m.conn.Close()
 			delete(mappings, key)
 			p.mappings.Add(-1)
