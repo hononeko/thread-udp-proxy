@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,6 +177,105 @@ func TestReusesMappingPerClient(t *testing.T) {
 	}
 	if got := p.Stats().ActiveMappings; got != 2 {
 		t.Fatalf("ActiveMappings = %d, want 2 (one per client port)", got)
+	}
+}
+
+func TestRelaysClientsConcurrently(t *testing.T) {
+	node := startNode(t)
+	conn := newFakeConn()
+	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	runProxy(t, p, conn)
+
+	// Every client's reply goroutine writes to conn on its own, so replies may arrive in any order.
+	const clients = 8
+	for i := range clients {
+		conn.in <- clientFrame(t, node, uint16(3000+i), "x")
+	}
+	seen := make(map[uint16]bool)
+	for range clients {
+		seen[awaitFrame(t, conn).DstPort] = true
+	}
+	if len(seen) != clients {
+		t.Fatalf("replies reached %d distinct clients, want %d", len(seen), clients)
+	}
+}
+
+func TestRepliesFollowClientMAC(t *testing.T) {
+	node := startNode(t)
+	conn := newFakeConn()
+	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	runProxy(t, p, conn)
+
+	conn.in <- clientFrame(t, node, 1000, "x")
+	if got := awaitFrame(t, conn); got.DstMAC.String() != clientMAC.String() {
+		t.Fatalf("reply went to %s, want %s", got.DstMAC, clientMAC)
+	}
+
+	// Same client address and port, new MAC (e.g. a failover): replies must follow it.
+	moved := net.HardwareAddr{0x02, 0, 0, 0, 0x30, 0}
+	frame := clientFrame(t, node, 1000, "y")
+	copy(frame[6:12], moved)
+	conn.in <- frame
+	if got := awaitFrame(t, conn); got.DstMAC.String() != moved.String() {
+		t.Fatalf("reply went to %s, want the new MAC %s", got.DstMAC, moved)
+	}
+	if got := p.Stats().ActiveMappings; got != 1 {
+		t.Fatalf("ActiveMappings = %d, want 1", got)
+	}
+}
+
+// gatedConn holds every WriteFrame until release is closed.
+type gatedConn struct {
+	*fakeConn
+	writing  chan struct{} // closed when the first write starts
+	release  chan struct{}
+	once     sync.Once
+	inFlight atomic.Int32
+}
+
+func (c *gatedConn) WriteFrame([]byte) error {
+	c.inFlight.Add(1)
+	defer c.inFlight.Add(-1)
+	c.once.Do(func() { close(c.writing) })
+	<-c.release
+	return nil
+}
+
+func TestRunWaitsForReplyWrites(t *testing.T) {
+	node := startNode(t)
+	conn := &gatedConn{fakeConn: newFakeConn(), writing: make(chan struct{}), release: make(chan struct{})}
+	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inFlightAtReturn := make(chan int32, 1)
+	go func() {
+		_ = p.Run(ctx, conn)
+		inFlightAtReturn <- conn.inFlight.Load()
+	}()
+
+	conn.in <- clientFrame(t, node, 1000, "x")
+	select {
+	case <-conn.writing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reply write started within 2s")
+	}
+	cancel()
+
+	// Run sees the cancellation within one read timeout (10ms here), but the caller closes conn once Run returns, so
+	// it must wait for the reply still being written.
+	select {
+	case <-inFlightAtReturn:
+		t.Fatal("Run returned while a reply was still being written to conn")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(conn.release)
+	select {
+	case n := <-inFlightAtReturn:
+		if n != 0 {
+			t.Fatalf("%d writes still in flight when Run returned", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after the reply write finished")
 	}
 }
 
