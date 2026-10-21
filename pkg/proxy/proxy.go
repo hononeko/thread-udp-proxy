@@ -114,15 +114,21 @@ type clientKey struct {
 	port uint16
 }
 
-// mapping is one client's NAT entry. The goroutine running Run owns the mappings map and conn; clientMAC and
-// lastActive are shared with the client's reply goroutine, hence atomic.
+// mapping is one client's NAT entry. The goroutine running Run owns the mappings map and conn's lifecycle, and the
+// client's reply goroutine reads from conn; clientMAC and lastActive are shared between the two, hence atomic.
 type mapping struct {
 	conn       *net.UDPConn
 	clientMAC  atomic.Pointer[net.HardwareAddr]
-	lastActive atomic.Int64 // Unix nanoseconds
+	lastActive atomic.Int64 // monotonic, see sinceStart
 }
 
-func (m *mapping) touch(now time.Time) { m.lastActive.Store(now.UnixNano()) }
+// start anchors sinceStart.
+var start = time.Now()
+
+// sinceStart is t on the monotonic clock as an integer, so idle checks are immune to wall-clock steps (NTP).
+func sinceStart(t time.Time) int64 { return int64(t.Sub(start)) }
+
+func (m *mapping) touch(now time.Time) { m.lastActive.Store(sinceStart(now)) }
 
 func (m *mapping) setClientMAC(mac net.HardwareAddr) { m.clientMAC.Store(&mac) }
 
@@ -245,7 +251,7 @@ func (p *Proxy) relayReplies(key clientKey, m *mapping, conn FrameConn) {
 
 func (p *Proxy) expire(now time.Time, mappings map[clientKey]*mapping) {
 	for key, m := range mappings {
-		if now.Sub(time.Unix(0, m.lastActive.Load())) > p.cfg.IdleTimeout {
+		if time.Duration(sinceStart(now)-m.lastActive.Load()) > p.cfg.IdleTimeout {
 			_ = m.conn.Close()
 			delete(mappings, key)
 			p.mappings.Add(-1)
