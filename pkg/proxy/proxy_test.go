@@ -84,6 +84,13 @@ func clientFrame(t *testing.T, dst netip.AddrPort, srcPort uint16, payload strin
 	return frame
 }
 
+// newProxy returns a proxy that relays to loopback, where startNode runs: lo stands in for the Thread interface.
+func newProxy(port uint16, idleTimeout time.Duration) *Proxy {
+	p := New(Config{Port: port, ThreadInterface: "lo", IdleTimeout: idleTimeout})
+	p.relays = func(addr netip.Addr) bool { return addr.IsLoopback() || relayable(addr) }
+	return p
+}
+
 func runProxy(t *testing.T, p *Proxy, conn FrameConn) <-chan error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -133,7 +140,7 @@ func eventually(t *testing.T, what string, cond func() bool) {
 func TestRelaysDatagramAndReply(t *testing.T) {
 	node := startNode(t)
 	conn := newFakeConn()
-	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	p := newProxy(node.Port(), time.Minute)
 	runProxy(t, p, conn)
 
 	conn.in <- clientFrame(t, node, 42557, "ping")
@@ -166,7 +173,7 @@ func TestRelaysDatagramAndReply(t *testing.T) {
 func TestReusesMappingPerClient(t *testing.T) {
 	node := startNode(t)
 	conn := newFakeConn()
-	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	p := newProxy(node.Port(), time.Minute)
 	runProxy(t, p, conn)
 
 	for _, srcPort := range []uint16{1000, 1000, 2000} {
@@ -183,7 +190,7 @@ func TestReusesMappingPerClient(t *testing.T) {
 func TestRelaysClientsConcurrently(t *testing.T) {
 	node := startNode(t)
 	conn := newFakeConn()
-	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	p := newProxy(node.Port(), time.Minute)
 	runProxy(t, p, conn)
 
 	// Every client's reply goroutine writes to conn on its own, so replies may arrive in any order.
@@ -203,7 +210,7 @@ func TestRelaysClientsConcurrently(t *testing.T) {
 func TestRepliesFollowClientMAC(t *testing.T) {
 	node := startNode(t)
 	conn := newFakeConn()
-	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	p := newProxy(node.Port(), time.Minute)
 	runProxy(t, p, conn)
 
 	conn.in <- clientFrame(t, node, 1000, "x")
@@ -244,7 +251,7 @@ func (c *gatedConn) WriteFrame([]byte) error {
 func TestRunWaitsForReplyWrites(t *testing.T) {
 	node := startNode(t)
 	conn := &gatedConn{fakeConn: newFakeConn(), writing: make(chan struct{}), release: make(chan struct{})}
-	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	p := newProxy(node.Port(), time.Minute)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	inFlightAtReturn := make(chan int32, 1)
@@ -282,12 +289,12 @@ func TestRunWaitsForReplyWrites(t *testing.T) {
 func TestIgnoresOtherTraffic(t *testing.T) {
 	node := startNode(t)
 	conn := newFakeConn()
-	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: time.Minute})
+	p := newProxy(node.Port(), time.Minute)
 	runProxy(t, p, conn)
 
 	conn.in <- []byte("not a frame")
 	conn.in <- clientFrame(t, netip.AddrPortFrom(node.Addr(), node.Port()+1), 1000, "wrong port")
-	conn.in <- clientFrame(t, netip.AddrPortFrom(netip.MustParseAddr("fd00::1"), node.Port()), 1000, "outside the prefixes")
+	conn.in <- clientFrame(t, netip.AddrPortFrom(netip.MustParseAddr("fe80::1"), node.Port()), 1000, "link-local")
 	// Frames are handled in order, so once this one is answered the others have been seen.
 	conn.in <- clientFrame(t, node, 1000, "relayed")
 
@@ -299,10 +306,89 @@ func TestIgnoresOtherTraffic(t *testing.T) {
 	}
 }
 
+func TestRelaysOnlyThroughTheThreadInterface(t *testing.T) {
+	node := startNode(t)
+	conn := newFakeConn()
+	p := newProxy(node.Port(), time.Minute)
+	runProxy(t, p, conn)
+
+	// The client's socket is bound to lo, which has no route anywhere else, the way wpan0 has none to the cluster
+	// network or the internet.
+	conn.in <- clientFrame(t, netip.AddrPortFrom(netip.MustParseAddr("2001:db8::1"), node.Port()), 1000, "elsewhere")
+	conn.in <- clientFrame(t, node, 1000, "relayed")
+
+	if got := awaitFrame(t, conn); string(got.Payload) != "pong:relayed" {
+		t.Fatalf("first reply = %q, want the relayed datagram's", got.Payload)
+	}
+	if stats := p.Stats(); stats.Forwarded != 1 || stats.Dropped != 1 {
+		t.Fatalf("stats = %+v, want 1 forwarded and the datagram for elsewhere dropped", stats)
+	}
+}
+
+func TestClosesSocketsBoundToARecreatedThreadInterface(t *testing.T) {
+	node := startNode(t)
+	conn := newFakeConn()
+	p := newProxy(node.Port(), time.Minute)
+	lo, err := p.threadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Driven directly instead of through Run, which only sweeps every few seconds.
+	mappings := make(map[clientKey]*mapping)
+	var replyWriters sync.WaitGroup
+	t.Cleanup(func() {
+		for _, m := range mappings {
+			_ = m.conn.Close()
+		}
+		replyWriters.Wait()
+	})
+	p.handleFrame(clientFrame(t, node, 1000, "x"), time.Now(), conn, mappings, &replyWriters)
+	awaitFrame(t, conn)
+
+	steps := []struct {
+		name        string
+		threadIndex func() (int, error)
+		want        int
+	}{
+		{"unchanged", func() (int, error) { return lo, nil }, 1},
+		// otbr-agent restarting: whether the socket is stale is only known once the interface is back.
+		{"missing", func() (int, error) { return 0, errors.New("no such network interface") }, 1},
+		{"recreated with a new index", func() (int, error) { return lo + 1, nil }, 0},
+	}
+	for _, step := range steps {
+		p.threadIndex = step.threadIndex
+		p.sweep(time.Now(), mappings)
+		if len(mappings) != step.want || p.Stats().ActiveMappings != int64(step.want) {
+			t.Fatalf("Thread interface %s: %d mappings (%d active), want %d", step.name, len(mappings), p.Stats().ActiveMappings, step.want)
+		}
+	}
+}
+
+func TestRelayable(t *testing.T) {
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{"fd2f:741e:f59b:1::1", true}, // an OMR prefix
+		{"fd71:3c82:737a:1::1", true}, // the one the border routers elected next
+		{"2001:db8:1:2::1", true},     // a global OMR prefix, from DHCPv6 prefix delegation
+		{"fe80::1", false},            // link-local: this host itself
+		{"::1", false},
+		{"ff05::1", false},
+		{"::", false},
+		{"::ffff:192.0.2.1", false},
+	}
+	for _, tt := range tests {
+		if got := relayable(netip.MustParseAddr(tt.addr)); got != tt.want {
+			t.Errorf("relayable(%s) = %t, want %t", tt.addr, got, tt.want)
+		}
+	}
+}
+
 func TestExpiresIdleClients(t *testing.T) {
 	node := startNode(t)
 	conn := newFakeConn()
-	p := New(Config{Port: node.Port(), Prefixes: []netip.Prefix{netip.MustParsePrefix("::1/128")}, IdleTimeout: 50 * time.Millisecond})
+	p := newProxy(node.Port(), 50*time.Millisecond)
 	runProxy(t, p, conn)
 
 	conn.in <- clientFrame(t, node, 1000, "x")
@@ -312,8 +398,7 @@ func TestExpiresIdleClients(t *testing.T) {
 
 func TestCountsOpenSocketFailures(t *testing.T) {
 	conn := newFakeConn()
-	p := New(Config{Port: 5540, Prefixes: []netip.Prefix{netip.MustParsePrefix("fc00::/7")}, IdleTimeout: time.Minute})
-	p.listen = func() (*net.UDPConn, error) { return nil, errors.New("no sockets left") }
+	p := New(Config{Port: 5540, ThreadInterface: "missing0", IdleTimeout: time.Minute})
 	runProxy(t, p, conn)
 
 	conn.in <- clientFrame(t, netip.MustParseAddrPort("[fd2f:741e:f59b:1::1]:5540"), 1000, "x")
@@ -325,7 +410,7 @@ func TestCountsOpenSocketFailures(t *testing.T) {
 
 func TestRunReturnsReadErrors(t *testing.T) {
 	conn := newFakeConn()
-	p := New(Config{Port: 5540, Prefixes: []netip.Prefix{netip.MustParsePrefix("fc00::/7")}, IdleTimeout: time.Minute})
+	p := New(Config{Port: 5540, IdleTimeout: time.Minute})
 	done := runProxy(t, p, conn)
 
 	conn.readErr <- errors.New("interface gone")
@@ -341,8 +426,8 @@ func TestRunReturnsReadErrors(t *testing.T) {
 
 func TestSweepInterval(t *testing.T) {
 	tests := []struct{ idle, want time.Duration }{
-		{5 * time.Minute, 30 * time.Second},
-		{20 * time.Second, 10 * time.Second},
+		{5 * time.Minute, 5 * time.Second},
+		{4 * time.Second, 2 * time.Second},
 		{time.Nanosecond, time.Millisecond},
 	}
 	for _, tt := range tests {

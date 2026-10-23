@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -72,14 +71,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	prefixes := make([]string, len(cfg.Prefixes))
-	for i, p := range cfg.Prefixes {
-		prefixes[i] = p.String()
-	}
 	logger.Info("Starting thread-udp-proxy", "version", version.Version, "interface", cfg.Interface,
-		"port", cfg.Port, "prefixes", strings.Join(prefixes, ","), "idleTimeout", cfg.IdleTimeout)
+		"threadInterface", cfg.ThreadInterface, "port", cfg.Port, "idleTimeout", cfg.IdleTimeout)
+	for _, key := range cfg.Obsolete {
+		logger.Warn("Ignoring a setting that no longer does anything, remove it", "setting", key)
+	}
 
-	p := proxy.New(proxy.Config{Port: cfg.Port, Prefixes: cfg.Prefixes, IdleTimeout: cfg.IdleTimeout})
+	p := proxy.New(proxy.Config{Port: cfg.Port, ThreadInterface: cfg.ThreadInterface, IdleTimeout: cfg.IdleTimeout})
 	st := &state{}
 	// Attach before serving, so the readiness probe is accurate from its first answer.
 	conn, err := proxy.Listen(cfg.Interface, cfg.Port, readTimeout)
@@ -176,24 +174,20 @@ func setupMux(cfg config.Config, p *proxy.Proxy, st *state) *http.ServeMux {
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		bound, lastErr := st.get()
 		stats := p.Stats()
-		prefixes := make([]string, len(cfg.Prefixes))
-		for i, prefix := range cfg.Prefixes {
-			prefixes[i] = prefix.String()
-		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"version":        version.Version,
-			"interface":      cfg.Interface,
-			"port":           cfg.Port,
-			"prefixes":       prefixes,
-			"idle_timeout":   cfg.IdleTimeout.String(),
-			"bound":          bound,
-			"last_error":     lastErr,
-			"forwarded":      stats.Forwarded,
-			"replies":        stats.Replies,
-			"dropped":        stats.Dropped,
-			"ignored":        stats.Ignored,
-			"active_clients": stats.ActiveMappings,
+			"version":          version.Version,
+			"interface":        cfg.Interface,
+			"thread_interface": cfg.ThreadInterface,
+			"port":             cfg.Port,
+			"idle_timeout":     cfg.IdleTimeout.String(),
+			"bound":            bound,
+			"last_error":       lastErr,
+			"forwarded":        stats.Forwarded,
+			"replies":          stats.Replies,
+			"dropped":          stats.Dropped,
+			"ignored":          stats.Ignored,
+			"active_clients":   stats.ActiveMappings,
 		})
 	})
 
@@ -218,7 +212,7 @@ thread_udp_proxy_reply_datagrams_total %d
 # HELP thread_udp_proxy_dropped_datagrams_total Datagrams that matched but could not be relayed.
 # TYPE thread_udp_proxy_dropped_datagrams_total counter
 thread_udp_proxy_dropped_datagrams_total %d
-# HELP thread_udp_proxy_ignored_frames_total Frames read from the interface that weren't ours to relay.
+# HELP thread_udp_proxy_ignored_frames_total Frames read from the interface but not relayed: malformed, or for a link-local, loopback or multicast destination.
 # TYPE thread_udp_proxy_ignored_frames_total counter
 thread_udp_proxy_ignored_frames_total %d
 # HELP thread_udp_proxy_active_clients Clients with an open relay socket.

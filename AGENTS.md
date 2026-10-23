@@ -44,6 +44,7 @@ Before committing or submitting changes, all of the following steps **MUST** pas
 ### 2.2 Packet Handling
 * **The data path stays allocation-light, single-owner and hand-off-free:** each datagram is relayed by the goroutine that read it, because waking another goroutine costs more than the relay itself on an idle host. The goroutine in `proxy.Run` reads frames, forwards them and alone owns the client mappings map, sweeping it between reads. Each client's reply goroutine writes its replies to the `FrameConn` itself, sharing only the fields on `mapping` that are atomic. Counters are atomics too. `Run` waits for every reply goroutine before returning, so its caller can close the `FrameConn` safely.
 * **Validate before trusting:** `packet.Parse` checks every length field before slicing. Malformed or unrelated frames are ignored silently, because the interface carries plenty of traffic that isn't ours.
+* **Stay in the mesh by interface, not by prefix:** every client's socket is bound to the Thread interface (`PROXY_THREAD_INTERFACE`, `bindToInterface`), so the kernel only routes what the proxy sends into the mesh, and only delivers it replies from the mesh. That holds whatever the Thread network's prefixes are, and they change whenever its border routers elect a new one. So there's no prefix setting. Don't add one back: a pinned prefix stops matching when the prefix changes, and the proxy then ignores every datagram. `relayable` still refuses link-local, loopback and multicast destinations, because a bound socket would send those into the mesh too. The sweep closes sockets bound to a Thread interface that was recreated, since they can't send any more.
 * **Never relay our own frames:** the raw socket only accepts `PACKET_HOST` frames, i.e. frames addressed to this host. Keep it that way, or replies can loop.
 * **Filter in the kernel, check in the proxy:** the raw socket carries a classic BPF filter (`relayFilter`) that only passes UDP over IPv6 to the relayed port, and ignores outgoing frames (`PACKET_IGNORE_OUTGOING`). This only saves work. `ReadFrame` and `handleFrame` keep every check, so the proxy stays correct without the filter. A filter change needs a case in `filter_test.go`, which runs the program in `x/net/bpf`'s VM.
 * **Checksums:** IPv6 UDP checksums are mandatory. `packet.Build` always writes one, never `0`.
@@ -55,7 +56,7 @@ Before committing or submitting changes, all of the following steps **MUST** pas
 
 ### 2.4 Testing Best Practices
 * **Deterministic tests:** never wait with a bare `time.Sleep`. Use channels, or polling loops with a deadline.
-* **No privileges in tests:** the proxy is tested through the `FrameConn` interface with a fake connection, and a loopback UDP server stands in for a Thread node. Code that needs `CAP_NET_RAW` stays in `rawsock_linux.go`, and the image smoke test covers it.
+* **No privileges in tests:** the proxy is tested through the `FrameConn` interface with a fake connection, and a loopback UDP server stands in for a Thread node: `newProxy` binds client sockets to `lo`, which Linux allows without privileges, and lets the proxy relay to loopback. Code that needs `CAP_NET_RAW` stays in `rawsock_linux.go`, and the image smoke test covers it.
 
 ---
 

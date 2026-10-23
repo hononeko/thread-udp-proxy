@@ -20,7 +20,7 @@ func newTestMux(t *testing.T) (*http.ServeMux, *state) {
 		t.Fatal(err)
 	}
 	st := &state{}
-	p := proxy.New(proxy.Config{Port: cfg.Port, Prefixes: cfg.Prefixes, IdleTimeout: cfg.IdleTimeout})
+	p := proxy.New(proxy.Config{Port: cfg.Port, ThreadInterface: cfg.ThreadInterface, IdleTimeout: cfg.IdleTimeout})
 	return setupMux(cfg, p, st), st
 }
 
@@ -68,7 +68,7 @@ func TestStatus(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("/status is not JSON: %v", err)
 	}
-	if body["interface"] != "net1" || body["port"] != float64(5540) || body["bound"] != true {
+	if body["interface"] != "net1" || body["thread_interface"] != "wpan0" || body["port"] != float64(5540) || body["bound"] != true {
 		t.Fatalf("/status = %v", body)
 	}
 }
