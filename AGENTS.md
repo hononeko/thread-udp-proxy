@@ -52,7 +52,7 @@ Before committing or submitting changes, all of the following steps **MUST** pas
 ### 2.3 Error Handling & Logging
 * **Wrap errors:** `fmt.Errorf("failed to ...: %w", err)`.
 * **Never swallow errors silently:** handle them with a fallback and a log line, count them in the `dropped` counter, or return them.
-* **Structured logging:** use `pkg/logger` (`charmbracelet/log`, interoperable with `log/slog`) with key-value pairs. Per-datagram logs are `Debug` only. `Info` is for lifecycle events: start, attach, new or expired client.
+* **Structured logging:** use `pkg/logger` (`charmbracelet/log`, interoperable with `log/slog`) with key-value pairs. Per-datagram logs are `Debug` only, and on the relay's success paths they're only built when `debugging()`: even dropped by the logger, one costs more than the rest of the proxy's own work on the datagram (`BenchmarkHandleFrame`). `Info` is for lifecycle events: start, attach, new or expired client.
 
 ### 2.4 Testing Best Practices
 * **Deterministic tests:** never wait with a bare `time.Sleep`. Use channels, or polling loops with a deadline.

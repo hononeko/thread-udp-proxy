@@ -231,7 +231,9 @@ func (p *Proxy) handleFrame(frame []byte, rx time.Time, conn FrameConn, mappings
 	}
 	p.forwardLatency.observe(time.Since(rx))
 	p.forwarded.Add(1)
-	logger.Debug("Forwarded datagram", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "dst", dst, "bytes", len(d.Payload))
+	if debugging() {
+		logger.Debug("Forwarded datagram", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "dst", dst, "bytes", len(d.Payload))
+	}
 }
 
 // relayReplies writes each reply arriving on m's socket back to the client as a frame on conn, until the socket is
@@ -270,7 +272,9 @@ func (p *Proxy) relayReplies(key clientKey, m *mapping, conn FrameConn) {
 		}
 		p.replyLatency.observe(time.Since(rx))
 		p.replies.Add(1)
-		logger.Debug("Returned reply", "from", from, "client", client, "bytes", n)
+		if debugging() {
+			logger.Debug("Returned reply", "from", from, "client", client, "bytes", n)
+		}
 	}
 }
 
@@ -308,6 +312,11 @@ func (p *Proxy) sweep(now time.Time, mappings map[clientKey]*mapping) {
 func relayable(addr netip.Addr) bool {
 	return addr.IsGlobalUnicast() && !addr.Is4In6()
 }
+
+// debugging reports whether debug logs are written. Each relayed datagram's debug log is only built when they are:
+// building one costs more than the rest of the proxy's own work on the datagram, even when the logger then drops it,
+// because the logger looks up its caller before checking the level, and boxing the arguments allocates.
+func debugging() bool { return logger.GetLevel() == "debug" }
 
 // sweepInterval sweeps often enough to expire idle clients within half a timeout of going idle, and to notice a
 // recreated Thread interface within 5s.
