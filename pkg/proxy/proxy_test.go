@@ -5,11 +5,13 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hononeko/thread-udp-proxy/pkg/logger"
 	"github.com/hononeko/thread-udp-proxy/pkg/packet"
 )
 
@@ -70,7 +72,7 @@ func startNode(t *testing.T) netip.AddrPort {
 	return conn.LocalAddr().(*net.UDPAddr).AddrPort()
 }
 
-func clientFrame(t *testing.T, dst netip.AddrPort, srcPort uint16, payload string) []byte {
+func clientFrame(t testing.TB, dst netip.AddrPort, srcPort uint16, payload string) []byte {
 	t.Helper()
 	frame, err := packet.Build(packet.Datagram{
 		DstMAC: proxyMAC, SrcMAC: clientMAC,
@@ -421,6 +423,54 @@ func TestRunReturnsReadErrors(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after a read error")
+	}
+}
+
+func TestDebuggingFollowsTheLogLevel(t *testing.T) {
+	t.Cleanup(func() { logger.SetLevel("info") })
+	logger.SetLevel("info")
+	if debugging() {
+		t.Fatal("debugging() = true with info logs")
+	}
+	// Otherwise LOG_LEVEL=debug would silently stop logging relayed datagrams.
+	logger.SetLevel("debug")
+	if !debugging() {
+		t.Fatal("debugging() = false with debug logs")
+	}
+}
+
+func BenchmarkHandleFrame(b *testing.B) {
+	// A node that never answers, so only the forward path is measured.
+	sink, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		b.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	b.Cleanup(func() { _ = sink.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			if _, _, err := sink.ReadFromUDPAddrPort(buf); err != nil {
+				return
+			}
+		}
+	}()
+	node := sink.LocalAddr().(*net.UDPAddr).AddrPort()
+	frame := clientFrame(b, node, 1000, strings.Repeat("x", 100))
+
+	p := newProxy(node.Port(), time.Minute)
+	conn := newFakeConn()
+	mappings := make(map[clientKey]*mapping)
+	var replyWriters sync.WaitGroup
+	b.Cleanup(func() {
+		for _, m := range mappings {
+			_ = m.conn.Close()
+		}
+		replyWriters.Wait()
+	})
+	p.handleFrame(frame, time.Now(), conn, mappings, &replyWriters) // opens the client's socket
+	b.ReportAllocs()
+	for b.Loop() {
+		p.handleFrame(frame, time.Now(), conn, mappings, &replyWriters)
 	}
 }
 
