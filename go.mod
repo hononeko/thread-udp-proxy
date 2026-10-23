@@ -1,6 +1,6 @@
 module github.com/hononeko/thread-udp-proxy
 
-go 1.27.2
+go 1.27.3
 
 require (
 	charm.land/log/v2 v2.0.1
