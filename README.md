@@ -8,8 +8,8 @@ It runs as a sidecar next to `otbr-agent`, sharing its network namespace. It's a
 
 When several border routers advertise the same Thread prefix, you don't choose which one a client uses, and replies from the mesh may come back through a different border router than the request went out on. This proxy pins both directions to one OTBR:
 
-1. The client routes traffic for the Thread prefix to the OTBR pod. That route can be static, or learned from the OTBR's router advertisements (e.g. `ot-ctl br rioprf high`).
-2. The proxy picks up those frames on the infrastructure interface and sends each payload into the mesh from a socket of its own, one per client. To the Thread node, the request comes from the OTBR.
+1. The client routes traffic for the Thread prefix to the OTBR pod. That route can be static, or learned from the OTBR's router advertisements (e.g. `ot-ctl br rioprf high`), which follow the Thread prefix when it changes.
+2. The proxy picks up those frames on the infrastructure interface and sends each payload into the mesh from a socket of its own, one per client, bound to the Thread interface. To the Thread node, the request comes from the OTBR.
 3. The node's reply comes back to that socket. The proxy writes it to the client as a raw frame that appears to come straight from the node.
 
 A BPF filter on the raw socket passes only UDP over IPv6 to the relayed port, so the rest of the interface's traffic (neighbor discovery, mDNS, the host's own frames) is dropped in the kernel and costs the proxy nothing. Each datagram is then relayed by the goroutine that read it, without a hand-off to another one, which keeps latency low when traffic is sparse and the proxy has to wake up for every datagram.
@@ -29,8 +29,8 @@ matter-server ◀──(raw frame, src = Thread node)──── net1 ┘   │
 | Variable | Default | Description |
 |---|---|---|
 | `PROXY_INTERFACE` | `net1` | Interface where client frames arrive and replies leave |
+| `PROXY_THREAD_INTERFACE` | `wpan0` | Interface into the Thread mesh. Every client's socket is bound to it, see [Destinations](#destinations) |
 | `PROXY_PORT` | `5540` | UDP destination port to relay (Matter) |
-| `PROXY_PREFIXES` | `fc00::/7` | Comma-separated IPv6 prefixes to relay, i.e. the Thread mesh's |
 | `PROXY_IDLE_TIMEOUT` | `5m` | Close a client's socket after this long without traffic |
 | `LISTEN_ADDR` | *(all)* | Bind address of the health and metrics server |
 | `LISTEN_PORT` | `9090` | Port of the health and metrics server |
@@ -39,6 +39,14 @@ matter-server ◀──(raw frame, src = Thread node)──── net1 ┘   │
 | `LOG_CALLER`, `LOG_TIMESTAMP`, `LOG_TIME_FORMAT`, `LOG_COLOR` | | As in the other hononeko sidecars |
 
 The proxy fails to start on an invalid setting instead of falling back to a default.
+
+### Destinations
+
+The proxy only relays into the Thread mesh, whatever its prefixes are. Every client's socket is bound to `PROXY_THREAD_INTERFACE`, so the kernel only routes what the proxy sends through that interface, and only delivers it replies that arrive on it. A datagram for anywhere else, such as the cluster network or the internet, is unreachable from that socket and counted as dropped. Link-local, loopback and multicast destinations are never relayed.
+
+There's no prefix to configure, because the Thread network's prefixes aren't stable. Its off-mesh routable (OMR) prefix changes whenever its border routers elect a new one, e.g. after one of them restarts or updates. The client's routes follow it through the OTBR's router advertisements, and so does the routing on `PROXY_THREAD_INTERFACE`.
+
+`PROXY_PREFIXES` is no longer used: pinned to a `/64`, it made the proxy ignore every datagram once the OMR prefix moved on. The proxy logs a warning at startup while it's still set. When otbr-agent restarts and recreates the Thread interface, the proxy closes the client sockets bound to the old one within 5s, and each client's next datagram opens a new one.
 
 ## Endpoints
 
@@ -49,7 +57,7 @@ The proxy fails to start on an invalid setting instead of falling back to a defa
 | `/status` | JSON: settings, attachment state, last error, counters |
 | `/metrics` | Prometheus: `thread_udp_proxy_up`, `_forwarded_datagrams_total`, `_reply_datagrams_total`, `_dropped_datagrams_total`, `_ignored_frames_total`, `_active_clients`, and the `_forward_latency_seconds` and `_reply_latency_seconds` histograms |
 
-The latency histograms measure the time each datagram spends in the proxy, from the kernel's receive timestamp to the send that relays it, from 10µs up to 100ms. `_ignored_frames_total` counts frames the proxy read from the interface but didn't relay, such as other traffic addressed to the host.
+The latency histograms measure the time each datagram spends in the proxy, from the kernel's receive timestamp to the send that relays it, from 10µs up to 100ms. `_ignored_frames_total` counts frames that got past the socket filter but weren't relayed: malformed ones, and ones for a link-local, loopback or multicast destination. Since the filter drops all other traffic, it should stay near 0.
 
 The binary also accepts `-healthcheck` (probes `/healthz`, for runtimes without `curl`) and `-version`.
 
@@ -60,9 +68,6 @@ The proxy needs **`CAP_NET_RAW`**. The image grants it to the binary as a file c
 ```yaml
 - name: thread-udp-proxy
   image: ghcr.io/hononeko/thread-udp-proxy:X.Y.Z
-  env:
-    - name: PROXY_PREFIXES
-      value: fd2f:741e:f59b:1::/64
   ports:
     - name: health
       containerPort: 9090

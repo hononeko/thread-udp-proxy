@@ -3,7 +3,6 @@ package config
 
 import (
 	"fmt"
-	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -13,21 +12,21 @@ import (
 
 // Defaults match an OpenThread Border Router pod with a Multus interface named net1 relaying Matter traffic.
 const (
-	DefaultInterface   = "net1"
-	DefaultPort        = 5540
-	DefaultPrefixes    = "fc00::/7"
-	DefaultIdleTimeout = 5 * time.Minute
-	DefaultListenPort  = "9090"
+	DefaultInterface       = "net1"
+	DefaultThreadInterface = "wpan0"
+	DefaultPort            = 5540
+	DefaultIdleTimeout     = 5 * time.Minute
+	DefaultListenPort      = "9090"
 )
 
 // Config is the complete runtime configuration.
 type Config struct {
 	// Interface is where clients' frames arrive and replies leave (PROXY_INTERFACE).
 	Interface string
+	// ThreadInterface is the interface into the Thread mesh, which client sockets are bound to (PROXY_THREAD_INTERFACE).
+	ThreadInterface string
 	// Port is the UDP destination port to relay (PROXY_PORT).
 	Port uint16
-	// Prefixes are the destinations to relay (PROXY_PREFIXES, comma-separated IPv6 CIDRs).
-	Prefixes []netip.Prefix
 	// IdleTimeout closes a client's socket after this long without traffic (PROXY_IDLE_TIMEOUT).
 	IdleTimeout time.Duration
 
@@ -36,7 +35,15 @@ type Config struct {
 	ListenPort string
 
 	Log logger.Options
+
+	// Obsolete lists the settings that are set but no longer do anything, so they can be warned about.
+	Obsolete []string
 }
+
+// obsolete are settings that no longer do anything. Setting one isn't an error, so deployments that still do keep
+// starting. PROXY_PREFIXES made the proxy refuse traffic clients route to it, and PROXY_THREAD_INTERFACE now keeps it
+// in the mesh instead.
+var obsolete = []string{"PROXY_PREFIXES"}
 
 // Load reads the configuration through lookup (os.LookupEnv in production). Invalid proxy settings are errors
 // rather than silent fallbacks: relaying the wrong traffic is worse than not starting.
@@ -49,9 +56,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 
 	cfg := Config{
-		Interface:  get("PROXY_INTERFACE", DefaultInterface),
-		ListenAddr: get("LISTEN_ADDR", ""),
-		ListenPort: get("LISTEN_PORT", DefaultListenPort),
+		Interface:       get("PROXY_INTERFACE", DefaultInterface),
+		ThreadInterface: get("PROXY_THREAD_INTERFACE", DefaultThreadInterface),
+		ListenAddr:      get("LISTEN_ADDR", ""),
+		ListenPort:      get("LISTEN_PORT", DefaultListenPort),
 		Log: logger.Options{
 			Level:      get("LOG_LEVEL", "info"),
 			Format:     get("LOG_FORMAT", "text"),
@@ -60,29 +68,16 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		},
 	}
 
+	// Bound to the interface clients' frames arrive on, the proxy would send their datagrams straight back out of it.
+	if cfg.ThreadInterface == cfg.Interface {
+		return Config{}, fmt.Errorf("PROXY_THREAD_INTERFACE must be the Thread interface, not PROXY_INTERFACE (%q)", cfg.Interface)
+	}
+
 	port, err := strconv.ParseUint(get("PROXY_PORT", strconv.Itoa(DefaultPort)), 10, 16)
 	if err != nil || port == 0 {
 		return Config{}, fmt.Errorf("PROXY_PORT must be a port between 1 and 65535, got %q", get("PROXY_PORT", ""))
 	}
 	cfg.Port = uint16(port)
-
-	for _, field := range strings.Split(get("PROXY_PREFIXES", DefaultPrefixes), ",") {
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
-		prefix, err := netip.ParsePrefix(field)
-		if err != nil {
-			return Config{}, fmt.Errorf("PROXY_PREFIXES: invalid prefix %q: %w", field, err)
-		}
-		if !prefix.Addr().Is6() || prefix.Addr().Is4In6() {
-			return Config{}, fmt.Errorf("PROXY_PREFIXES: %s is not an IPv6 prefix", prefix)
-		}
-		cfg.Prefixes = append(cfg.Prefixes, prefix.Masked())
-	}
-	if len(cfg.Prefixes) == 0 {
-		return Config{}, fmt.Errorf("PROXY_PREFIXES must list at least one prefix")
-	}
 
 	cfg.IdleTimeout, err = time.ParseDuration(get("PROXY_IDLE_TIMEOUT", DefaultIdleTimeout.String()))
 	if err != nil || cfg.IdleTimeout <= 0 {
@@ -94,6 +89,12 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if cfg.Log.ReportTimestamp, err = parseBool(get("LOG_TIMESTAMP", "true")); err != nil {
 		return Config{}, fmt.Errorf("LOG_TIMESTAMP: %w", err)
+	}
+
+	for _, key := range obsolete {
+		if get(key, "") != "" {
+			cfg.Obsolete = append(cfg.Obsolete, key)
+		}
 	}
 	return cfg, nil
 }

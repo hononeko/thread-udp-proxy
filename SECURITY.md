@@ -31,6 +31,6 @@ I aim to acknowledge your report within 48 hours and to provide an estimated tim
 When deploying this sidecar, please consider the following:
 
 - **Grant only `NET_RAW`:** the container needs `CAP_NET_RAW` for its raw packet socket and nothing else. Drop all other capabilities and keep the default nonroot user.
-- **Scope what it relays:** set `PROXY_PREFIXES` to your Thread mesh's prefixes rather than relying on the broad `fc00::/7` default.
+- **Point `PROXY_THREAD_INTERFACE` at the mesh:** every client's socket is bound to it, so the proxy only sends into the Thread mesh and only takes replies from it. A device on the infrastructure network can't use the proxy to reach the cluster network or the internet.
 - **Internal networks only:** the infrastructure interface should be a trusted LAN segment. Anything that can send frames to the pod's MAC can send datagrams into the Thread mesh through it.
-- **Keep the health server private:** bind `LISTEN_ADDR` to `127.0.0.1`, or restrict who can reach port `9090` with a network policy. It exposes no controls, but `/status` reveals the mesh's prefixes.
+- **Keep the health server private:** bind `LISTEN_ADDR` to `127.0.0.1`, or restrict who can reach port `9090` with a network policy. It exposes no controls, but `/status` reveals the proxy's settings and traffic counters.

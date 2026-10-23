@@ -2,9 +2,9 @@
 // back, by NATing each client through a local UDP socket.
 //
 // A client (e.g. matter-server) routes traffic for the Thread prefix to this host's MAC. The proxy picks those frames
-// up from a raw packet socket, sends each payload to its Thread destination from a socket bound to this host, and
-// writes every reply back to the client as a raw frame that appears to come straight from the Thread node. Thread
-// nodes therefore only ever see this host as the source, so their replies route back through it.
+// up from a raw packet socket, sends each payload to its Thread destination from a socket bound to this host's Thread
+// interface, and writes every reply back to the client as a raw frame that appears to come straight from the Thread
+// node. Thread nodes therefore only ever see this host as the source, so their replies route back through it.
 package proxy
 
 import (
@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/hononeko/thread-udp-proxy/pkg/logger"
@@ -43,8 +44,9 @@ type FrameConn interface {
 type Config struct {
 	// Port is the UDP destination port to relay (5540 for Matter).
 	Port uint16
-	// Prefixes are the destinations to relay, i.e. the Thread mesh's prefixes.
-	Prefixes []netip.Prefix
+	// ThreadInterface is the interface into the Thread mesh (wpan0). Each client's socket is bound to it, so the proxy
+	// only ever sends into the mesh, and only takes replies that come from it.
+	ThreadInterface string
 	// IdleTimeout closes a client's socket after this long without traffic in either direction.
 	IdleTimeout time.Duration
 }
@@ -66,8 +68,13 @@ type Stats struct {
 // Proxy relays matching datagrams between clients and the Thread mesh. Run may be called again with a new FrameConn
 // after it returns; Stats accumulate across runs.
 type Proxy struct {
-	cfg    Config
-	listen func() (*net.UDPConn, error)
+	cfg Config
+	// threadIndex returns the Thread interface's index. otbr-agent recreates the interface when it restarts, with a new
+	// index, and a socket bound to the old one can't send any more.
+	threadIndex func() (int, error)
+	// relays reports whether to relay a datagram for a destination: relayable, except in tests, which also relay to
+	// loopback, where their stand-in Thread node runs.
+	relays func(netip.Addr) bool
 
 	forwarded atomic.Uint64
 	replies   atomic.Uint64
@@ -82,18 +89,34 @@ type Proxy struct {
 // New returns a proxy for cfg.
 func New(cfg Config) *Proxy {
 	return &Proxy{
-		cfg: cfg,
-		listen: func() (*net.UDPConn, error) {
-			conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified})
+		cfg:    cfg,
+		relays: relayable,
+		threadIndex: func() (int, error) {
+			ifi, err := net.InterfaceByName(cfg.ThreadInterface)
 			if err != nil {
-				return nil, err
+				return 0, fmt.Errorf("failed to find the Thread interface %q: %w", cfg.ThreadInterface, err)
 			}
-			if err := enableTimestamps(conn); err != nil {
-				logger.Debug("Kernel receive timestamps unavailable, measuring reply latency from the read", "err", err)
-			}
-			return conn, nil
+			return ifi.Index, nil
 		},
 	}
+}
+
+// listen opens a client's socket, bound to the Thread interface, and returns the index of the interface it's bound to.
+func (p *Proxy) listen() (*net.UDPConn, int, error) {
+	ifindex, err := p.threadIndex()
+	if err != nil {
+		return nil, 0, err
+	}
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error { return bindToInterface(c, ifindex) }}
+	pc, err := lc.ListenPacket(context.Background(), "udp6", "[::]:0")
+	if err != nil {
+		return nil, 0, err
+	}
+	conn := pc.(*net.UDPConn)
+	if err := enableTimestamps(conn); err != nil {
+		logger.Debug("Kernel receive timestamps unavailable, measuring reply latency from the read", "err", err)
+	}
+	return conn, ifindex, nil
 }
 
 // Stats returns a snapshot of the counters.
@@ -117,9 +140,11 @@ type clientKey struct {
 // mapping is one client's NAT entry. The goroutine running Run owns the mappings map and conn's lifecycle, and the
 // client's reply goroutine reads from conn; clientMAC and lastActive are shared between the two, hence atomic.
 type mapping struct {
-	conn       *net.UDPConn
-	clientMAC  atomic.Pointer[net.HardwareAddr]
-	lastActive atomic.Int64 // monotonic, see sinceStart
+	conn *net.UDPConn
+	// threadIndex is the index of the Thread interface conn is bound to.
+	threadIndex int
+	clientMAC   atomic.Pointer[net.HardwareAddr]
+	lastActive  atomic.Int64 // monotonic, see sinceStart
 }
 
 // start anchors sinceStart.
@@ -153,9 +178,9 @@ func (p *Proxy) Run(ctx context.Context, conn FrameConn) error {
 	buf := make([]byte, 65536)
 	for ctx.Err() == nil {
 		n, rx, err := conn.ReadFrame(buf)
-		// Reads time out regularly, so idle clients are swept here too, without another goroutine touching mappings.
+		// Reads time out regularly, so clients are swept here too, without another goroutine touching mappings.
 		if now := time.Now(); !now.Before(nextSweep) {
-			p.expire(now, mappings)
+			p.sweep(now, mappings)
 			nextSweep = now.Add(interval)
 		}
 		if errors.Is(err, ErrTimeout) {
@@ -181,13 +206,13 @@ func (p *Proxy) handleFrame(frame []byte, rx time.Time, conn FrameConn, mappings
 	key := clientKey{addr: d.SrcIP, port: d.SrcPort}
 	m, ok := mappings[key]
 	if !ok {
-		udpConn, err := p.listen()
+		udpConn, threadIndex, err := p.listen()
 		if err != nil {
 			p.dropped.Add(1)
 			logger.Warn("Failed to open a socket for a new client", "client", netip.AddrPortFrom(d.SrcIP, d.SrcPort), "err", err)
 			return
 		}
-		m = &mapping{conn: udpConn}
+		m = &mapping{conn: udpConn, threadIndex: threadIndex}
 		m.setClientMAC(d.SrcMAC)
 		mappings[key] = m
 		p.mappings.Add(1)
@@ -249,27 +274,43 @@ func (p *Proxy) relayReplies(key clientKey, m *mapping, conn FrameConn) {
 	}
 }
 
-func (p *Proxy) expire(now time.Time, mappings map[clientKey]*mapping) {
+// sweep closes the sockets of clients that have been idle for longer than the idle timeout, and of those bound to a
+// Thread interface that was recreated since, which can't send any more. A client's next datagram opens a new socket.
+func (p *Proxy) sweep(now time.Time, mappings map[clientKey]*mapping) {
+	if len(mappings) == 0 {
+		return
+	}
+	// While the interface is missing (otbr-agent restarting), sockets are left alone: whether they're stale is only
+	// known once it's back.
+	threadIndex, err := p.threadIndex()
 	for key, m := range mappings {
-		if time.Duration(sinceStart(now)-m.lastActive.Load()) > p.cfg.IdleTimeout {
-			_ = m.conn.Close()
-			delete(mappings, key)
-			p.mappings.Add(-1)
-			logger.Info("Expired idle client", "client", netip.AddrPortFrom(key.addr, key.port))
+		idle := time.Duration(sinceStart(now)-m.lastActive.Load()) > p.cfg.IdleTimeout
+		stale := err == nil && m.threadIndex != threadIndex
+		if !idle && !stale {
+			continue
+		}
+		_ = m.conn.Close()
+		delete(mappings, key)
+		p.mappings.Add(-1)
+		client := netip.AddrPortFrom(key.addr, key.port)
+		if idle {
+			logger.Info("Expired idle client", "client", client)
+		} else {
+			logger.Info("Closed a client's socket bound to the old Thread interface", "client", client)
 		}
 	}
 }
 
-func (p *Proxy) relays(addr netip.Addr) bool {
-	for _, prefix := range p.cfg.Prefixes {
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
+// relayable reports whether the proxy relays datagrams for addr: any unicast address beyond this link, i.e. not
+// link-local, loopback, multicast or unspecified, nor IPv4-mapped. A client's socket would send those through the
+// Thread interface it's bound to, into the mesh. Every other destination is either in the mesh or unreachable from
+// that socket, so there's no prefix to match, and the proxy keeps working when the Thread network's prefixes change.
+func relayable(addr netip.Addr) bool {
+	return addr.IsGlobalUnicast() && !addr.Is4In6()
 }
 
-// sweepInterval checks for idle clients often enough to expire them within half a timeout of going idle.
+// sweepInterval sweeps often enough to expire idle clients within half a timeout of going idle, and to notice a
+// recreated Thread interface within 5s.
 func sweepInterval(idle time.Duration) time.Duration {
-	return min(max(idle/2, time.Millisecond), 30*time.Second)
+	return min(max(idle/2, time.Millisecond), 5*time.Second)
 }
