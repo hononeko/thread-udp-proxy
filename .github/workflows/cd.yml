@@ -11,9 +11,10 @@ on:
         type: boolean
         default: false
 
+# Queue rather than cancel: a second dispatch (such as a dry run) must never abort a release mid-way.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
