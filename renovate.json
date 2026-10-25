@@ -37,14 +37,6 @@
       "minimumReleaseAge": "0 days"
     },
     {
-      "description": "Group GitHub Actions setup-go Go version updates. No release age: actions/go-versions publishes a day or two after the Go release, so it would lag behind go.mod and leave the Go directive ahead of the toolchain",
-      "matchManagers": ["github-actions"],
-      "matchPackageNames": ["go", "actions/go-versions"],
-      "matchDepNames": ["go", "actions/go-versions"],
-      "groupName": "Go",
-      "minimumReleaseAge": "0 days"
-    },
-    {
       "matchUpdateTypes": [
         "minor",
         "patch",
