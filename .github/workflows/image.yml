@@ -61,7 +61,7 @@ jobs:
 
       # Attached to the container's eth0, readiness proves the nonroot binary can open its raw packet socket.
       - name: Smoke test
-        uses: hononeko/actions/smoke-test@e1fdec215f80fc9a1574c61b15303f6789d09b7c # v1.4.7
+        uses: hononeko/actions/smoke-test@0db95ecb039dad2e450e9e0d0f18364bb10c2256 # v1.4.8
         with:
           image: smoke:${{ matrix.arch }}
           port: "9090"
