@@ -161,8 +161,12 @@ func TestRelaysDatagramAndReply(t *testing.T) {
 		t.Errorf("reply MACs = %s -> %s, want %s -> %s", got.SrcMAC, got.DstMAC, proxyMAC, clientMAC)
 	}
 
-	// The reply is counted after its frame is written, so wait for that before checking the counters.
-	eventually(t, "the reply to be counted", func() bool { return p.Stats().Replies == 1 })
+	// Each is counted after its write, and the node can answer before the forward is counted, so wait for both
+	// before checking the counters.
+	eventually(t, "the datagram and its reply to be counted", func() bool {
+		s := p.Stats()
+		return s.Forwarded == 1 && s.Replies == 1
+	})
 	stats := p.Stats()
 	if stats.Forwarded != 1 || stats.Replies != 1 || stats.Dropped != 0 || stats.ActiveMappings != 1 {
 		t.Errorf("stats = %+v, want 1 forwarded, 1 reply, 0 dropped, 1 mapping", stats)
