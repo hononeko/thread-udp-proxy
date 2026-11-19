@@ -54,8 +54,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           tags: smoke:${{ matrix.arch }}
           build-args: VERSION=${{ inputs.version || 'dev' }}
-          cache-from: type=gha,scope=image-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+          cache-scope: image-${{ matrix.arch }}
 
       # Attached to the container's eth0, readiness proves the nonroot binary can open its raw packet socket.
       - name: Smoke test
@@ -85,5 +84,6 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           push: "true"
           build-args: VERSION=${{ inputs.version || 'dev' }}
-          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-scope: image-${{ matrix.arch }}
+          cache-write: "false"
           digest-artifact: digests-${{ matrix.arch }}
